@@ -79,7 +79,8 @@ func NewSTDIOServer(cfg *config.Config, logger *slog.Logger) (*STDIOServer, erro
 // registerTools registers all tools for the configured profile
 func (s *STDIOServer) registerTools() error {
 	// Add tools to the MCP server with auth mode for dynamic OID parameter handling
-	if err := tools.AddToolsToServer(s.mcpServer, s.config.Server.Profile, s.config.Auth.Mode); err != nil {
+	// Pass SDK cache, auth context, and GCS manager so they can be injected into handler contexts
+	if err := tools.AddToolsToServerWithContext(s.mcpServer, s.config.Server.Profile, s.config.Auth.Mode, s.config.Auth, s.sdkCache, s.gcsManager); err != nil {
 		return err
 	}
 

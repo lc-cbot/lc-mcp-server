@@ -50,3 +50,4 @@ bin/
 .env.local
 lc-mcp-server
 __pycache__/
+install.sh

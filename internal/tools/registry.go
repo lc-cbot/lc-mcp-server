@@ -412,6 +412,119 @@ func AddToolsToServer(s *server.MCPServer, profile string, authMode auth.AuthMod
 	return nil
 }
 
+// AddToolsToServerWithContext adds all tools for a profile to an MCP server with context injection.
+// This is used for STDIO mode where the SDK cache and auth context need to be injected into each request.
+func AddToolsToServerWithContext(s *server.MCPServer, profile string, authMode auth.AuthMode, authCtx *auth.AuthContext, sdkCache *auth.SDKCache, gcsManager *gcs.Manager) error {
+	toolNames := GetToolsForProfile(profile)
+	isUIDMode := IsUIDMode(authMode)
+
+	for _, name := range toolNames {
+		reg, ok := GetTool(name)
+		if !ok {
+			// Tool not implemented yet - skip silently
+			continue
+		}
+
+		// Get schema from either interface or legacy fields
+		var schema mcp.Tool
+		var requiresOID bool
+
+		if reg.Tool != nil {
+			// Use interface-based tool
+			schema = reg.Tool.Schema()
+			requiresOID = reg.Tool.RequiresOID()
+		} else {
+			// Use legacy struct fields
+			schema = reg.Schema
+			requiresOID = reg.RequiresOID
+		}
+
+		// Dynamically add OID parameter if tool requires it and we're in UID mode
+		if requiresOID && isUIDMode {
+			schema = AddOIDToToolSchema(schema)
+		}
+
+		// Wrap handler with context injection
+		wrappedHandler := wrapHandlerWithContext(reg, isUIDMode, authCtx, sdkCache, gcsManager)
+
+		// Add tool to server
+		s.AddTool(schema, wrappedHandler)
+	}
+
+	return nil
+}
+
+// wrapHandlerWithContext wraps handlers with context injection for STDIO mode.
+// This ensures SDK cache and auth context are available to all tool handlers.
+func wrapHandlerWithContext(reg *ToolRegistration, isUIDMode bool, authCtx *auth.AuthContext, sdkCache *auth.SDKCache, gcsManager *gcs.Manager) func(context.Context, mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	return func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		// Inject auth context into the request context
+		ctx = auth.WithAuthContext(ctx, authCtx)
+
+		// Inject SDK cache into the request context
+		ctx = auth.WithSDKCache(ctx, sdkCache)
+
+		// Inject GCS manager if available
+		if gcsManager != nil {
+			ctx = gcs.WithGCSManager(ctx, gcsManager)
+		}
+
+		// Extract arguments using the method
+		args := request.GetArguments()
+
+		// Determine if tool requires OID from either interface or legacy fields
+		var requiresOID bool
+		var toolName string
+
+		if reg.Tool != nil {
+			requiresOID = reg.Tool.RequiresOID()
+			toolName = reg.Tool.Name()
+		} else {
+			requiresOID = reg.RequiresOID
+			toolName = reg.Name
+		}
+
+		// Automatically handle OID switching for tools that require it in UID mode
+		if requiresOID && isUIDMode {
+			if oidParam, ok := args["oid"].(string); ok && oidParam != "" {
+				var err error
+				// Pass nil logger - WithOID will use slog.Default() as fallback
+				ctx, err = auth.WithOID(ctx, oidParam, nil)
+				if err != nil {
+					return mcp.NewToolResultError(fmt.Sprintf("failed to switch OID: %v", err)), nil
+				}
+			}
+		}
+
+		// Call the appropriate handler (interface or legacy)
+		var result *mcp.CallToolResult
+		var err error
+
+		if reg.Tool != nil {
+			// Use interface-based tool
+			result, err = reg.Tool.Handle(ctx, args)
+		} else {
+			// Use legacy handler
+			result, err = reg.Handler(ctx, args)
+		}
+
+		if err != nil {
+			return result, err
+		}
+
+		// Try to wrap large results with GCS
+		wrappedResult := gcs.WrapMCPResult(ctx, result, toolName)
+
+		// Type assert back to *mcp.CallToolResult
+		if mcpResult, ok := wrappedResult.(*mcp.CallToolResult); ok {
+			return mcpResult, nil
+		}
+
+		// If type assertion fails, return original
+		return result, nil
+	}
+}
+
 // wrapHandler converts our ToolHandler to mcp-go's expected signature,
 // handles OID switching for tools that require it, and wraps large results with GCS if available.
 // It supports both interface-based and legacy struct-based tools.
